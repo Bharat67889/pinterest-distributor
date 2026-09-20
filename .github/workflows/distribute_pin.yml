@@ -1,0 +1,22 @@
+name: Pinterest Multi-Account Distributor
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [trigger-pin-distribution]
+
+jobs:
+  distribute:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm install
+
+      - name: Run Multi-Account Pinterest Distributor
+        run: node upload.js
