@@ -2,6 +2,8 @@ const fs = require("fs");
 const crypto = require("crypto");
 const axios = require("axios");
 const FormData = require("form-data");
+const { execSync } = require("child_process");
+const path = require("path");
 
 const SHEET_CSV_URL =
   "https://docs.google.com/spreadsheets/d/1MrwItyy6IPNLSJbz1b53TGOTS2JBLTyg46Ql9xZpI6w/gviz/tq?tqx=out:csv&sheet=PinterestQueue";
@@ -13,7 +15,6 @@ const BASE_HOST = "https://in.pinterest.com";
 // =====================================================================
 const CLOUD_NAME = "djlipqlut";
 const BANNER_WIDTH = 380;
-const BANNER_GRAVITY = "north_west";
 const BANNER_MARGIN_X = 10;
 const BANNER_MARGIN_Y = 40;
 
@@ -36,10 +37,6 @@ const PINTEREST_ACCOUNTS_POOL = [
     csrfToken: "32604e7060850646f4d69f9cd0d7b9ce"
   }
 ];
-
-function buildCloudinaryUrl(publicId, stickerName) {
-  return `https://res.cloudinary.com/${CLOUD_NAME}/video/upload/l_${stickerName},w_${BANNER_WIDTH},g_${BANNER_GRAVITY},x_${BANNER_MARGIN_X},y_${BANNER_MARGIN_Y}/${publicId}.mp4`;
-}
 
 function extractPublicId(url) {
   const match = url.match(/\/([^\/\?]+)\.mp4/);
@@ -74,17 +71,31 @@ function getHeaders(acc) {
 }
 
 async function downloadFile(url, destPath) {
-  const response = await axios.get(url, {
-    responseType: "arraybuffer",
-    timeout: 30000,
-    maxRedirects: 5,
-    headers: { "User-Agent": "Mozilla/5.0" },
-    validateStatus: () => true
+  const res = await axios({
+    method: "GET",
+    url: url,
+    responseType: "stream",
+    timeout: 60000
   });
-  if (response.status !== 200) {
-    throw new Error(`Download HTTP Error: ${response.status}`);
-  }
-  fs.writeFileSync(destPath, Buffer.from(response.data));
+  const writer = fs.createWriteStream(destPath);
+  res.data.pipe(writer);
+  return new Promise((resolve, reject) => {
+    writer.on("finish", resolve);
+    writer.on("error", reject);
+  });
+}
+
+// Local FFmpeg Rendering (Sticker overlay with fast preset)
+function renderVideoWithSticker(inputVideo, stickerImg, outputPath) {
+  const filterString = "[1:v]scale=" + BANNER_WIDTH + ":-1[stk];[0:v][stk]overlay=" + BANNER_MARGIN_X + ":" + BANNER_MARGIN_Y;
+  const cmd = 'ffmpeg -y -i "' + inputVideo + '" -i "' + stickerImg + '" -filter_complex "' + filterString + '" -c:a copy -preset ultrafast "' + outputPath + '"';
+  execSync(cmd, { stdio: "pipe" });
+}
+
+// Extract frame for cover image directly from rendered video
+function generateCoverLocally(videoPath, outJpgPath) {
+  const cmd = 'ffmpeg -y -ss 00:00:01 -i "' + videoPath + '" -vframes 1 -q:v 2 "' + outJpgPath + '"';
+  execSync(cmd, { stdio: "pipe" });
 }
 
 async function fetchUserBoards(headers) {
@@ -107,12 +118,12 @@ async function fetchUserBoards(headers) {
   throw new Error("No boards found for account.");
 }
 
-async function registerMediaUpload(headers) {
+async function registerMediaUpload(headers, mediaType = "video-story-pin") {
   const clientUUID = crypto.randomUUID();
   const payload = new URLSearchParams({
     source_url: "/pin-creation-tool/",
     data: JSON.stringify({
-      options: { url: "/v3/media/uploads/register/batch/", data: { media_info_list: JSON.stringify([{ id: clientUUID, media_type: "video-story-pin" }]) } },
+      options: { url: "/v3/media/uploads/register/batch/", data: { media_info_list: JSON.stringify([{ id: clientUUID, media_type: mediaType }]) } },
       context: {}
     })
   });
@@ -122,13 +133,13 @@ async function registerMediaUpload(headers) {
   return dataMap[clientUUID];
 }
 
-async function uploadVideoToS3(uploadData, filePath) {
+async function uploadToS3(uploadData, filePath, contentType = "video/mp4", filename = "video.mp4") {
   const form = new FormData();
   for (const [key, value] of Object.entries(uploadData.upload_parameters)) {
     form.append(key, value);
   }
   const fileData = fs.readFileSync(filePath);
-  form.append("file", fileData, { filename: "video.mp4", contentType: "video/mp4", knownLength: fileData.length });
+  form.append("file", fileData, { filename: filename, contentType: contentType, knownLength: fileData.length });
 
   const s3Res = await axios.post(uploadData.upload_url, form, {
     headers: { ...form.getHeaders() },
@@ -162,6 +173,8 @@ async function createPinWithCover(caption, link, uploadId, boardId, coverUrl, he
 
 (async () => {
   const totalScriptStart = Date.now();
+  const baseRawVideo = path.join(__dirname, "base_raw_pin.mp4");
+
   try {
     console.log("📊 Reading latest target reel from Google Sheet...");
     const sheetRaw = await (await fetch(SHEET_CSV_URL)).text();
@@ -190,41 +203,57 @@ async function createPinWithCover(caption, link, uploadId, boardId, coverUrl, he
     console.log(`🎯 Target Video Public ID: ${cloudVideoId}`);
     console.log(`📋 Base Caption: ${chosenRow.caption}`);
 
-    // Sequential loop across pool with isolated error handling
+    // Download RAW base video ONCE (Zero Cloudinary transform credits)
+    const rawVideoUrl = "https://res.cloudinary.com/" + CLOUD_NAME + "/video/upload/" + cloudVideoId + ".mp4";
+    console.log(`⬇️ Downloading base video: ${rawVideoUrl}`);
+    await downloadFile(rawVideoUrl, baseRawVideo);
+
+    // Sequential loop across Pinterest pool
     for (const acc of PINTEREST_ACCOUNTS_POOL) {
-      const tempFile = `video_${acc.tagPrefix}.mp4`;
+      const tempVideo = path.join(__dirname, `rendered_${acc.tagPrefix}.mp4`);
+      const tempSticker = path.join(__dirname, `${acc.sticker}.png`);
+      const tempCover = path.join(__dirname, `cover_${acc.tagPrefix}.jpg`);
+
       try {
         console.log(`\n============================================`);
-        console.log(`🚀 Processing Pinterest: [${acc.name}] (Prefix: ${acc.tagPrefix})`);
+        console.log(`🚀 Processing Pinterest: [\({acc.name}] (Prefix:\){acc.tagPrefix})`);
         console.log(`============================================`);
 
         const headers = getHeaders(acc);
         const boards = await fetchUserBoards(headers);
-        console.log(`📋 Found ${boards.length} boards on ${acc.name}.`);
+        console.log(`📋 Found \({boards.length} boards on\){acc.name}.`);
 
-        const targetVideoUrl = buildCloudinaryUrl(cloudVideoId, acc.sticker);
-        const targetCaption = `${acc.tagPrefix}${chosenRow.caption}`;
+        // 1. Fetch sticker PNG from Cloudinary
+        const stickerUrl = "https://res.cloudinary.com/" + CLOUD_NAME + "/image/upload/" + acc.sticker + ".png";
+        await downloadFile(stickerUrl, tempSticker);
 
-        console.log(`📥 Downloading stream with sticker [${acc.sticker}]...`);
-        await downloadFile(targetVideoUrl, tempFile);
+        // 2. Render local video with sticker via FFmpeg
+        console.log(`🎬 Rendering local video with sticker [${acc.sticker}]...`);
+        renderVideoWithSticker(baseRawVideo, tempSticker, tempVideo);
+
+        // 3. Generate cover JPEG directly from rendered video
+        generateCoverLocally(tempVideo, tempCover);
+
+        const targetCaption = `\({acc.tagPrefix}\){chosenRow.caption}`;
 
         console.log(`📡 Step 1: Registering media...`);
         const uploadData = await registerMediaUpload(headers);
 
         console.log(`☁️ Step 2: Uploading S3 buffer...`);
-        await uploadVideoToS3(uploadData, tempFile);
+        await uploadToS3(uploadData, tempVideo, "video/mp4", "video.mp4");
 
         console.log(`⏳ Waiting 300s transcode buffer...`);
         await new Promise(r => setTimeout(r, 300000));
 
-        const coverUrl = targetVideoUrl.replace(/\.mp4(\?.*)?$/i, ".jpg");
+        // Direct Cloudinary raw base cover fallback (zero transformation)
+        const coverUrl = "https://res.cloudinary.com/" + CLOUD_NAME + "/video/upload/" + cloudVideoId + ".jpg";
 
         console.log(`🚀 Step 3: Publishing Pin...`);
         let published = false;
         for (const board of boards) {
           const pinRes = await createPinWithCover(targetCaption, chosenRow.link, uploadData.upload_id, board.id, coverUrl, headers);
           if (pinRes?.resource_response?.data?.id) {
-            console.log(`🎉 SUCCESS! Pin Published on [${acc.name}] | Board: ${board.name} | Pin ID: ${pinRes.resource_response.data.id}`);
+            console.log(`🎉 SUCCESS! Pin Published on [\({acc.name}] | Board:\){board.name} | Pin ID: ${pinRes.resource_response.data.id}`);
             published = true;
             break;
           }
@@ -234,11 +263,11 @@ async function createPinWithCover(caption, link, uploadId, boardId, coverUrl, he
           console.error(`⚠️ Could not publish pin on any board for ${acc.name}`);
         }
       } catch (accErr) {
-        console.error(`❌ [Account Error - ${acc.name} Skipped]: ${accErr.message}`);
+        console.error(`❌ [Account Error - \({acc.name} Skipped]:\){accErr.message}`);
       } finally {
-        if (fs.existsSync(tempFile)) {
-          fs.unlinkSync(tempFile);
-        }
+        if (fs.existsSync(tempVideo)) fs.unlinkSync(tempVideo);
+        if (fs.existsSync(tempSticker)) fs.unlinkSync(tempSticker);
+        if (fs.existsSync(tempCover)) fs.unlinkSync(tempCover);
       }
     }
 
@@ -247,5 +276,9 @@ async function createPinWithCover(caption, link, uploadId, boardId, coverUrl, he
   } catch (err) {
     console.error(`\n❌ [Fatal Error]: ${err.message}`);
     process.exit(1);
+  } finally {
+    if (fs.existsSync(baseRawVideo)) {
+      fs.unlinkSync(baseRawVideo);
+    }
   }
 })();
