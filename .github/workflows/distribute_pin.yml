@@ -16,6 +16,9 @@ jobs:
         with:
           node-version: 20
 
+      - name: Setup FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+
       - run: npm install
 
       - name: Run Multi-Account Pinterest Distributor
